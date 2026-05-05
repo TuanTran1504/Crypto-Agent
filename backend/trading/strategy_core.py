@@ -11,11 +11,13 @@ Public API:
   find_sr_levels(df_h1, current_price, df_m15) -> dict
   build_trade_plan(signal, setup_name, context, df_exec) -> (dict | None, str)
   validate_ai_trade_decision(decision, context, df_exec) -> (bool, str)
+  build_rule_based_signal_decision(context, df_exec) -> dict
   compute_score(context) -> (int, list[str])
   classify_trend(gap_pct, ema34, ema89, threshold, atr_pct) -> str
 """
 
 import os
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -761,7 +763,7 @@ def detect_candle_pattern(df: pd.DataFrame, idx: int) -> dict:
 def validate_ai_trade_decision(decision: dict, context: dict,
                                df_exec: pd.DataFrame = None) -> tuple[bool, str]:
     """
-    Confirms the AI signal follows the current market structure.
+    Confirms the selected signal follows the current market structure.
     """
     signal = str(decision.get("signal", "")).upper()
     if signal not in ("BUY", "SELL"):
@@ -1109,11 +1111,351 @@ def _exec_entry_timing_ok(signal: str, context: dict,
     return True, "OK"
 
 
+def _pattern_name(pattern: dict[str, str] | None) -> str:
+    text = str((pattern or {}).get("pattern") or "none").strip().replace("_", " ")
+    return text if text else "none"
+
+
+def _pattern_matches_signal(pattern: dict[str, str] | None, signal: str) -> bool:
+    return str((pattern or {}).get("direction") or "").upper() == str(signal or "").upper()
+
+
+def _build_analysis_payload(
+    *,
+    signal: str,
+    setup_name: str,
+    context: dict,
+    df_exec: pd.DataFrame,
+    setup_reason: str,
+) -> dict[str, str]:
+    closes = df_exec["close"].astype(float)
+    ema34_series = closes.ewm(span=34, adjust=False).mean()
+    ema89_series = closes.ewm(span=89, adjust=False).mean()
+    ema34 = float(ema34_series.iloc[-1])
+    ema89 = float(ema89_series.iloc[-1])
+    latest = df_exec.iloc[-1]
+    latest_open = float(latest["open"])
+    latest_close = float(latest["close"])
+    latest_high = float(latest["high"])
+    latest_low = float(latest["low"])
+    latest_volume = float(latest.get("volume", 0.0))
+    prev_vol_mean = float(df_exec.tail(6).iloc[:-1]["volume"].mean()) if len(df_exec) >= 6 else latest_volume
+    volume_state = "above" if prev_vol_mean > 0 and latest_volume >= prev_vol_mean else "below"
+    pattern_latest = detect_candle_pattern(df_exec, len(df_exec) - 1)
+    pattern_prev = detect_candle_pattern(df_exec, len(df_exec) - 2)
+    primary = str(context.get("primary_trend") or context.get("m15_trend") or "?")
+    gap = float(context.get("m15_gap") or 0.0)
+    gap_move = "widening" if context.get("ema_gap_widening") else "stable/narrowing"
+    candle_side = "bullish" if latest_close >= latest_open else "bearish"
+    candle_range = max(latest_high - latest_low, 1e-9)
+    body = abs(latest_close - latest_open)
+    upper_wick = latest_high - max(latest_open, latest_close)
+    lower_wick = min(latest_open, latest_close) - latest_low
+
+    return {
+        "setup_identified": setup_name,
+        "ema_check": (
+            f"EMA34 {'above' if ema34 > ema89 else 'below' if ema34 < ema89 else 'near'} "
+            f"EMA89. M15 trend={primary}. Gap {gap_move} at {gap:.3f}%."
+        ),
+        "price_action": (
+            f"Latest candle {candle_side}; body={body:.4f}, upper_wick={upper_wick:.4f}, "
+            f"lower_wick={lower_wick:.4f}. "
+            f"Patterns latest={_pattern_name(pattern_latest)}, prev={_pattern_name(pattern_prev)}."
+        ),
+        "volume_check": (
+            f"Latest volume {volume_state} recent mean "
+            f"({latest_volume:.0f} vs {prev_vol_mean:.0f})."
+        ),
+        "rr_check": "Python will calculate entry, stop loss, take profit, and final R:R.",
+        "pattern_match": (
+            f"{setup_reason} Latest candle range={candle_range:.4f}. "
+            f"Signal direction={signal}."
+        ),
+    }
+
+
+def _setup_a_precheck(signal: str, context: dict, df_exec: pd.DataFrame) -> tuple[bool, str]:
+    if df_exec is None or len(df_exec) < 6:
+        return False, "not enough candles for EMA pullback setup"
+
+    closes = df_exec["close"].astype(float)
+    highs = df_exec["high"].astype(float)
+    lows = df_exec["low"].astype(float)
+    ema34_series = closes.ewm(span=34, adjust=False).mean()
+    ema89_series = closes.ewm(span=89, adjust=False).mean()
+    ema34 = float(ema34_series.iloc[-1])
+    ema89 = float(ema89_series.iloc[-1])
+    latest_close = float(closes.iloc[-1])
+    latest_open = float(df_exec["open"].iloc[-1])
+    prev_close = float(closes.iloc[-2])
+    atr = float(context.get("atr_m15") or context.get("atr") or 0.0)
+    price = float(context.get("current_price") or latest_close or 0.0)
+    zone_buffer = max(atr * 0.35, price * 0.0015) if price > 0 else max(atr * 0.35, 0.0)
+    recent_low = float(lows.tail(2).min())
+    recent_high = float(highs.tail(2).max())
+    latest_pattern = detect_candle_pattern(df_exec, len(df_exec) - 1)
+    prev_pattern = detect_candle_pattern(df_exec, len(df_exec) - 2)
+
+    if signal == "BUY":
+        touched_zone = recent_low <= ema34 + zone_buffer or recent_low <= ema89 + zone_buffer
+        if not touched_zone:
+            return False, "pullback did not revisit EMA34/EMA89 demand zone"
+        if latest_close < ema34 and latest_close <= prev_close:
+            return False, "latest close has not reclaimed the EMA pullback area"
+        if not (
+            latest_close > latest_open
+            or _pattern_matches_signal(latest_pattern, signal)
+            or _pattern_matches_signal(prev_pattern, signal)
+        ):
+            return False, "no bullish reaction candle from EMA pullback zone"
+        return True, "EMA pullback touched support zone and printed bullish reaction"
+
+    touched_zone = recent_high >= ema34 - zone_buffer or recent_high >= ema89 - zone_buffer
+    if not touched_zone:
+        return False, "rally did not revisit EMA34/EMA89 supply zone"
+    if latest_close > ema34 and latest_close >= prev_close:
+        return False, "latest close has not rejected the EMA rally area"
+    if not (
+        latest_close < latest_open
+        or _pattern_matches_signal(latest_pattern, signal)
+        or _pattern_matches_signal(prev_pattern, signal)
+    ):
+        return False, "no bearish reaction candle from EMA rally zone"
+    return True, "EMA rally touched supply zone and printed bearish reaction"
+
+
+def _setup_d_precheck(signal: str, context: dict, df_exec: pd.DataFrame) -> tuple[bool, str]:
+    if df_exec is None or len(df_exec) < 6:
+        return False, "not enough candles for range reaction setup"
+
+    sr = dict(context.get("sr") or {})
+    support = sr.get("support")
+    resistance = sr.get("resistance")
+    if support is None or resistance is None:
+        return False, "missing support/resistance levels for range setup"
+
+    latest = df_exec.iloc[-1]
+    latest_open = float(latest["open"])
+    latest_close = float(latest["close"])
+    latest_low = float(latest["low"])
+    latest_high = float(latest["high"])
+    prev = df_exec.iloc[-2]
+    prev_low = float(prev["low"])
+    prev_high = float(prev["high"])
+    atr = float(context.get("atr_m15") or context.get("atr") or 0.0)
+    price = float(context.get("current_price") or latest_close or 0.0)
+    edge_buffer = max(atr * 0.45, price * 0.0020) if price > 0 else max(atr * 0.45, 0.0)
+    latest_pattern = detect_candle_pattern(df_exec, len(df_exec) - 1)
+    prev_pattern = detect_candle_pattern(df_exec, len(df_exec) - 2)
+    range_bias = str(context.get("range_bias") or get_range_bias(context))
+    rsi = float(context.get("rsi") or 50.0)
+
+    if signal == "BUY":
+        if range_bias != "NEAR_SUPPORT":
+            return False, f"range BUY requires NEAR_SUPPORT, got {range_bias}"
+        if min(latest_low, prev_low) > float(support) + edge_buffer:
+            return False, "price did not test support closely enough for range BUY"
+        if latest_close < float(support):
+            return False, "latest close is still below support"
+        if not (
+            latest_close > latest_open
+            or _pattern_matches_signal(latest_pattern, signal)
+            or _pattern_matches_signal(prev_pattern, signal)
+            or rsi <= 42
+        ):
+            return False, "no bullish reaction from range support"
+        return True, "range support tested with bullish reaction"
+
+    if range_bias != "NEAR_RESISTANCE":
+        return False, f"range SELL requires NEAR_RESISTANCE, got {range_bias}"
+    if max(latest_high, prev_high) < float(resistance) - edge_buffer:
+        return False, "price did not test resistance closely enough for range SELL"
+    if latest_close > float(resistance):
+        return False, "latest close is still above resistance"
+    if not (
+        latest_close < latest_open
+        or _pattern_matches_signal(latest_pattern, signal)
+        or _pattern_matches_signal(prev_pattern, signal)
+        or rsi >= 58
+    ):
+        return False, "no bearish reaction from range resistance"
+    return True, "range resistance tested with bearish reaction"
+
+
+def _setup_precheck(setup_code: str, signal: str, context: dict, df_exec: pd.DataFrame) -> tuple[bool, str]:
+    if setup_code == "A":
+        return _setup_a_precheck(signal, context, df_exec)
+    if setup_code == "D":
+        return _setup_d_precheck(signal, context, df_exec)
+    if setup_code == "B":
+        return True, "candidate breakout setup selected for structural validation"
+    if setup_code == "C":
+        return True, "candidate retest setup selected for structural validation"
+    return False, f"unsupported setup {setup_code!r}"
+
+
+def _candidate_setups_for_context(context: dict) -> list[tuple[str, str, str]]:
+    primary = str(context.get("primary_trend") or context.get("m15_trend") or "").upper()
+    allowed_direction = str(context.get("allowed_direction") or "BOTH").upper()
+    is_range = bool(context.get("is_range", False))
+    range_bias = str(context.get("range_bias") or "")
+
+    candidates: list[tuple[str, str, str]] = []
+    if is_range or primary in {"SIDEWAY", "VOLATILE_RANGE"}:
+        if allowed_direction != "DOWN" and range_bias == "NEAR_SUPPORT":
+            candidates.append(("D", "BUY", "Range support bounce candidate"))
+        if allowed_direction != "UP" and range_bias == "NEAR_RESISTANCE":
+            candidates.append(("D", "SELL", "Range resistance rejection candidate"))
+        return candidates
+
+    if primary == "UPTREND" and allowed_direction != "DOWN":
+        return [
+            ("C", "BUY", "Trend retest-hold candidate"),
+            ("B", "BUY", "Trend breakout continuation candidate"),
+            ("A", "BUY", "Trend EMA pullback candidate"),
+        ]
+
+    if primary == "DOWNTREND" and allowed_direction != "UP":
+        return [
+            ("C", "SELL", "Trend retest-fail candidate"),
+            ("B", "SELL", "Trend breakdown continuation candidate"),
+            ("A", "SELL", "Trend EMA rally-sell candidate"),
+        ]
+
+    return candidates
+
+
+def build_rule_based_signal_decision(context: dict, df_exec: pd.DataFrame) -> dict[str, Any]:
+    """
+    Deterministic replacement for the old chart+LLM setup selection.
+
+    It proposes a setup candidate from the current market regime, then runs the
+    same structural/timing validator and trade planner already used by the live
+    engine. This keeps execution deterministic and replayable.
+    """
+    base_context = dict(context or {})
+    if "range_bias" not in base_context and base_context.get("is_range"):
+        base_context["range_bias"] = get_range_bias(base_context)
+
+    if df_exec is None or len(df_exec) < 8:
+        return {
+            "analysis": {
+                "setup_identified": "None",
+                "ema_check": "Insufficient execution candles.",
+                "price_action": "Not enough candles to classify a setup.",
+                "volume_check": "N/A",
+                "rr_check": "Python would calculate R:R after a valid setup appears.",
+                "pattern_match": "No setup candidate evaluated.",
+            },
+            "signal": "WAIT",
+            "reason": "Not enough execution candles for deterministic setup selection.",
+            "entry_price": float(base_context.get("current_price") or float(df_exec["close"].iloc[-1])),
+            "stop_loss": 0.0,
+            "take_profit": 0.0,
+            "_meta": {"selector": "rule_based"},
+        }
+
+    candidate_checks: list[dict[str, str]] = []
+    current_price = float(base_context.get("current_price") or float(df_exec["close"].iloc[-1]))
+
+    for setup_code, signal, candidate_reason in _candidate_setups_for_context(base_context):
+        setup_name = f"Setup {setup_code}"
+        precheck_ok, precheck_reason = _setup_precheck(setup_code, signal, base_context, df_exec)
+        candidate_checks.append(
+            {
+                "setup": setup_name,
+                "signal": signal,
+                "stage": "precheck",
+                "result": "PASS" if precheck_ok else "FAIL",
+                "reason": precheck_reason,
+            }
+        )
+        if not precheck_ok:
+            continue
+
+        decision = {
+            "analysis": _build_analysis_payload(
+                signal=signal,
+                setup_name=setup_name,
+                context=base_context,
+                df_exec=df_exec,
+                setup_reason=f"{candidate_reason}. {precheck_reason}.",
+            ),
+            "signal": signal,
+            "reason": candidate_reason,
+            "entry_price": current_price,
+            "stop_loss": 0.0,
+            "take_profit": 0.0,
+            "_meta": {"selector": "rule_based"},
+        }
+
+        valid, valid_reason = validate_ai_trade_decision(decision, base_context, df_exec)
+        candidate_checks.append(
+            {
+                "setup": setup_name,
+                "signal": signal,
+                "stage": "validation",
+                "result": "PASS" if valid else "FAIL",
+                "reason": valid_reason,
+            }
+        )
+        if not valid:
+            continue
+
+        plan, plan_reason = build_trade_plan(signal, setup_name, base_context, df_exec)
+        candidate_checks.append(
+            {
+                "setup": setup_name,
+                "signal": signal,
+                "stage": "planning",
+                "result": "PASS" if plan else "FAIL",
+                "reason": plan_reason,
+            }
+        )
+        if not plan:
+            continue
+
+        decision["reason"] = f"{candidate_reason}. {valid_reason}. {plan_reason}"
+        decision["analysis"]["rr_check"] = (
+            f"Python previewed Entry={plan['entry_price']} SL={plan['stop_loss']} "
+            f"TP={plan['take_profit']} net R:R={plan['rr']:.2f}. Final levels will be recalculated before execution."
+        )
+        decision["entry_price"] = float(plan["entry_price"])
+        decision["stop_loss"] = float(plan["stop_loss"])
+        decision["take_profit"] = float(plan["take_profit"])
+        decision["take_profit_1"] = float(plan["take_profit_1"])
+        decision["take_profit_2"] = float(plan["take_profit_2"])
+        decision["target_mode"] = str(plan["target_mode"])
+        decision["planned_rr"] = float(plan["rr"])
+        decision["_meta"]["candidate_checks"] = candidate_checks
+        return decision
+
+    return {
+        "analysis": _build_analysis_payload(
+            signal="WAIT",
+            setup_name="None",
+            context=base_context,
+            df_exec=df_exec,
+            setup_reason="No candidate setup passed deterministic precheck, validation, and trade planning.",
+        ),
+        "signal": "WAIT",
+        "reason": "No deterministic setup passed validation and R:R planning.",
+        "entry_price": current_price,
+        "stop_loss": 0.0,
+        "take_profit": 0.0,
+        "_meta": {
+            "selector": "rule_based",
+            "candidate_checks": candidate_checks,
+        },
+    }
+
+
 def build_trade_plan(signal: str, setup_name: str, context: dict,
                      df_exec: pd.DataFrame) -> tuple[dict | None, str]:
     """
     Deterministically builds entry, stop loss, and take profit from structure.
-    Gemini decides whether a setup is valid; Python owns the trade levels.
+    Setup selection happens upstream; Python owns the trade levels.
     The caller chooses the execution frame used for structure.
     """
     signal = str(signal or "").upper()

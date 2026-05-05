@@ -16,6 +16,7 @@ import hmac
 import json
 import math
 import os
+import re
 import time
 import threading
 import urllib.error
@@ -25,6 +26,7 @@ from datetime import datetime, timezone, timedelta
 UTC = timezone.utc
 VN_TZ = timezone(timedelta(hours=7))
 from pathlib import Path
+from typing import Any
 
 import psycopg2
 from psycopg2 import errors
@@ -33,12 +35,11 @@ import redis
 from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
-from chart_gen      import generate_chart
-from llm_analyst    import ask_gemini
 from strategy_core  import (
     compute_indicators, compute_score, find_sr_levels,
     check_macro_bias, check_technical_gates, get_range_bias,
     validate_ai_trade_decision, build_trade_plan, compute_max_stop_pct,
+    build_rule_based_signal_decision,
 )
 from strategy_policy import (
     ActiveStrategyPolicy,
@@ -53,7 +54,7 @@ from strategy_policy import (
 )
 from trade_logger   import (
     get_logger, log_cycle_start, log_gate_pass, log_gate_fail,
-    log_ai_request, log_ai_response, log_trade_open, log_trade_close,
+    log_trade_open, log_trade_close,
     log_skip, log_error, log_cycle_summary,
 )
 
@@ -70,6 +71,7 @@ REDIS_URL    = os.getenv("REDIS_URL", "")
 ACCOUNT_TYPE   = "live"
 TRADES_TABLE   = "trades_live"
 FILLS_TABLE    = "trade_fills_live"
+OPPORTUNITIES_TABLE = "strategy_opportunities_live"
 SYMBOLS        = ["BTC", "ETH", "SOL"]
 STRATEGY_POLICY_ENGINE_NAME = os.getenv("STRATEGY_POLICY_ENGINE_NAME", "llm_live")
 LEVERAGE       = 5
@@ -435,6 +437,196 @@ def _is_transient_db_error(exc: Exception) -> bool:
     return any(marker in msg for marker in transient_markers)
 
 
+def _json_default(value: Any):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat()
+    return str(value)
+
+
+def _compact_json(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=True, default=_json_default))
+    except Exception:
+        return {"serialization_error": str(value)}
+
+
+def _extract_rr_diagnostics(plan_reason: str) -> dict[str, float] | None:
+    text = str(plan_reason or "")
+    match = re.search(r"TP1 RR ([0-9.]+) < ([0-9.]+)", text)
+    if not match:
+        return None
+    out = {
+        "tp1_rr": float(match.group(1)),
+        "min_rr": float(match.group(2)),
+    }
+    match_tp2 = re.search(r"TP2 RR ([0-9.]+)", text)
+    if match_tp2:
+        out["tp2_rr"] = float(match_tp2.group(1))
+        out["best_rr"] = max(out["tp1_rr"], out["tp2_rr"])
+    else:
+        out["best_rr"] = out["tp1_rr"]
+    return out
+
+
+def _build_context_snapshot(ctx: dict[str, Any]) -> dict[str, Any]:
+    sr = dict(ctx.get("sr") or {})
+    return {
+        "symbol": ctx.get("symbol"),
+        "market_mode": ctx.get("market_mode"),
+        "score": ctx.get("score"),
+        "score_details": list(ctx.get("score_details") or []),
+        "current_price": ctx.get("current_price"),
+        "primary_trend": ctx.get("primary_trend"),
+        "h1_trend": ctx.get("h1_trend"),
+        "m15_trend": ctx.get("m15_trend"),
+        "btc_trend": ctx.get("btc_trend"),
+        "btc_macro_trend": ctx.get("btc_macro_trend"),
+        "allowed_direction": ctx.get("allowed_direction"),
+        "is_range": ctx.get("is_range"),
+        "range_bias": ctx.get("range_bias"),
+        "rsi": ctx.get("rsi"),
+        "atr_m15": ctx.get("atr_m15"),
+        "adx_m15": ctx.get("adx_m15"),
+        "m15_gap": ctx.get("m15_gap"),
+        "fear_greed": ctx.get("fear_greed"),
+        "funding_rate": ctx.get("funding_rate"),
+        "sr": {
+            "support": sr.get("support"),
+            "resistance": sr.get("resistance"),
+            "prev_support": sr.get("prev_support"),
+            "prev_resistance": sr.get("prev_resistance"),
+            "breakout_state": sr.get("breakout_state"),
+            "breakout_confirmed": sr.get("breakout_confirmed"),
+            "bars_since_breakout": sr.get("bars_since_breakout"),
+        },
+    }
+
+
+def _build_preview_plan_payload(plan: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+    if plan:
+        payload = dict(plan)
+        payload["status"] = "READY"
+        payload["reason"] = reason
+        return _compact_json(payload)
+    payload = {
+        "status": "REJECTED",
+        "reason": reason,
+    }
+    rr_diagnostics = _extract_rr_diagnostics(reason)
+    if rr_diagnostics:
+        payload.update(rr_diagnostics)
+    return payload
+
+
+def _decision_for_snapshot(decision: dict[str, Any], plan: dict[str, Any] | None = None) -> dict[str, Any]:
+    snapshot = _compact_json(decision if isinstance(decision, dict) else {})
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    if plan:
+        snapshot["entry_price"] = plan.get("entry_price")
+        snapshot["stop_loss"] = plan.get("stop_loss")
+        snapshot["take_profit"] = plan.get("take_profit")
+        snapshot["take_profit_1"] = plan.get("take_profit_1")
+        snapshot["take_profit_2"] = plan.get("take_profit_2")
+        snapshot["target_mode"] = plan.get("target_mode")
+        snapshot["planned_rr"] = plan.get("rr")
+    return snapshot
+
+
+def db_record_opportunity(
+    *,
+    symbol: str,
+    signal: str,
+    setup: str,
+    status: str,
+    status_reason: str,
+    context: dict[str, Any],
+    decision: dict[str, Any],
+    preview_plan_payload: dict[str, Any],
+    linked_trade_id: int | None = None,
+    execution_ref: str | None = None,
+):
+    policy_id = _ACTIVE_STRATEGY_POLICY.id if _ACTIVE_STRATEGY_POLICY else None
+    policy_version = _ACTIVE_STRATEGY_POLICY.version if _ACTIVE_STRATEGY_POLICY else None
+    decision_analysis = dict(decision.get("analysis") or {})
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {OPPORTUNITIES_TABLE}
+                  (engine_name, account_type, symbol, cycle_at, signal, setup, status,
+                   status_reason, decision_reason, market_mode, primary_trend,
+                   allowed_direction, is_range, range_bias, score, current_price,
+                   entry_price, stop_loss, take_profit, take_profit_2, planned_rr, target_mode,
+                   strategy_policy_id, strategy_policy_version, linked_trade_id, execution_ref,
+                   preview_plan_json, context_json, decision_json)
+                VALUES
+                  (%s, %s, %s, NOW(), %s, %s, %s,
+                   %s, %s, %s, %s,
+                   %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s, %s, %s,
+                   %s, %s, %s, %s,
+                   %s::jsonb, %s::jsonb, %s::jsonb)
+                """,
+                (
+                    STRATEGY_POLICY_ENGINE_NAME,
+                    ACCOUNT_TYPE,
+                    symbol,
+                    signal,
+                    setup,
+                    status,
+                    status_reason[:500],
+                    str(decision.get("reason") or "")[:500],
+                    context.get("market_mode"),
+                    context.get("primary_trend") or context.get("m15_trend"),
+                    context.get("allowed_direction"),
+                    bool(context.get("is_range", False)),
+                    context.get("range_bias"),
+                    context.get("score"),
+                    context.get("current_price"),
+                    decision.get("entry_price"),
+                    decision.get("stop_loss"),
+                    decision.get("take_profit"),
+                    decision.get("take_profit_2"),
+                    decision.get("planned_rr"),
+                    decision.get("target_mode"),
+                    policy_id,
+                    policy_version,
+                    linked_trade_id,
+                    execution_ref,
+                    json.dumps(_compact_json(preview_plan_payload), ensure_ascii=True, default=_json_default),
+                    json.dumps(_build_context_snapshot(context), ensure_ascii=True, default=_json_default),
+                    json.dumps(
+                        _compact_json(
+                            {
+                                "signal": decision.get("signal"),
+                                "reason": decision.get("reason"),
+                                "analysis": decision_analysis,
+                                "entry_price": decision.get("entry_price"),
+                                "stop_loss": decision.get("stop_loss"),
+                                "take_profit": decision.get("take_profit"),
+                                "take_profit_1": decision.get("take_profit_1"),
+                                "take_profit_2": decision.get("take_profit_2"),
+                                "target_mode": decision.get("target_mode"),
+                                "planned_rr": decision.get("planned_rr"),
+                                "_meta": decision.get("_meta"),
+                            }
+                        ),
+                        ensure_ascii=True,
+                        default=_json_default,
+                    ),
+                ),
+            )
+        conn.commit()
+    except Exception as e:
+        log.warning(f"[DB] Opportunity snapshot failed {symbol} status={status}: {e}")
+    finally:
+        conn.close()
+
+
 def db_ensure_trades_table():
     conn = _get_conn()
     try:
@@ -493,6 +685,40 @@ def db_ensure_trades_table():
                 )
             """)
             cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {OPPORTUNITIES_TABLE} (
+                    id                      BIGSERIAL PRIMARY KEY,
+                    engine_name             TEXT NOT NULL,
+                    account_type            TEXT NOT NULL,
+                    symbol                  TEXT NOT NULL,
+                    cycle_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    signal                  TEXT,
+                    setup                   TEXT,
+                    status                  TEXT NOT NULL,
+                    status_reason           TEXT,
+                    decision_reason         TEXT,
+                    market_mode             TEXT,
+                    primary_trend           TEXT,
+                    allowed_direction       TEXT,
+                    is_range                BOOLEAN DEFAULT FALSE,
+                    range_bias              TEXT,
+                    score                   INTEGER,
+                    current_price           FLOAT,
+                    entry_price             FLOAT,
+                    stop_loss               FLOAT,
+                    take_profit             FLOAT,
+                    take_profit_2           FLOAT,
+                    planned_rr              FLOAT,
+                    target_mode             TEXT,
+                    strategy_policy_id      BIGINT,
+                    strategy_policy_version INTEGER,
+                    linked_trade_id         BIGINT,
+                    execution_ref           TEXT,
+                    preview_plan_json       JSONB DEFAULT '{{}}'::jsonb,
+                    context_json            JSONB DEFAULT '{{}}'::jsonb,
+                    decision_json           JSONB DEFAULT '{{}}'::jsonb
+                )
+            """)
+            cur.execute(f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS {TRADES_TABLE}_one_open_position_per_account_symbol_idx
                 ON {TRADES_TABLE} (account_type, symbol)
                 WHERE status = 'OPEN'
@@ -501,6 +727,14 @@ def db_ensure_trades_table():
                 CREATE UNIQUE INDEX IF NOT EXISTS {TRADES_TABLE}_one_pending_per_account_symbol_idx
                 ON {TRADES_TABLE} (account_type, symbol)
                 WHERE status = 'PENDING'
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {OPPORTUNITIES_TABLE}_account_cycle_idx
+                ON {OPPORTUNITIES_TABLE} (account_type, cycle_at DESC)
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS {OPPORTUNITIES_TABLE}_policy_cycle_idx
+                ON {OPPORTUNITIES_TABLE} (strategy_policy_id, cycle_at DESC)
             """)
         conn.commit()
     finally:
@@ -881,19 +1115,35 @@ def _recover_orphaned_positions(client: UMFutures, open_trades: list[dict]):
         )
 
         claimed_trade_id = None
+        recovered_setup = "RECOVERED_ORPHAN"
+        recovered_note = "Recovered Binance position without original setup context"
         conn = _get_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute(f"""
                     INSERT INTO {TRADES_TABLE}
                       (symbol, side, status, entry_price, quantity, leverage,
-                       stop_loss, take_profit, confidence, horizon, account_type)
-                    VALUES (%s,%s,'OPEN',%s,%s,%s,%s,%s, 0, 1, %s)
+                       stop_loss, take_profit, confidence, setup, notes, horizon, account_type)
+                    VALUES (%s,%s,'OPEN',%s,%s,%s,%s,%s, 0, %s, %s, 1, %s)
                     RETURNING id
-                """, (sym, side, entry, qty, LEVERAGE, sl, tp, ACCOUNT_TYPE))
+                """, (
+                    sym,
+                    side,
+                    entry,
+                    qty,
+                    LEVERAGE,
+                    sl,
+                    tp,
+                    recovered_setup,
+                    recovered_note,
+                    ACCOUNT_TYPE,
+                ))
                 claimed_trade_id = cur.fetchone()[0]
             conn.commit()
-            log.info(f"[MONITOR] Recovery record inserted for {sym} {side} @ {entry} id={claimed_trade_id}")
+            log.info(
+                f"[MONITOR] Recovery record inserted for {sym} {side} @ {entry} "
+                f"id={claimed_trade_id} setup={recovered_setup}"
+            )
         except errors.UniqueViolation:
             conn.rollback()
             log.info(f"[MONITOR] Orphan {sym} already claimed by another monitor - skipping recovery insert")
@@ -1421,7 +1671,7 @@ def min_balance_required_for_symbol(symbol: str, entry_price: float, min_notiona
     return max(min_notional, min_notional_for_step) / denom
 
 def _signal_follows_trend(signal: str, context: dict) -> tuple[bool, str]:
-    """Hard guard: AI signal must align with directional trend."""
+    """Hard guard: selected signal must align with directional trend."""
     if signal not in ("BUY", "SELL"):
         return False, f"invalid signal {signal}"
 
@@ -1435,10 +1685,11 @@ def _signal_follows_trend(signal: str, context: dict) -> tuple[bool, str]:
 
 
 def execute_trade(client: UMFutures, symbol: str, decision: dict,
-                  balance: float, context: dict, dry_run: bool = False) -> bool:
+                  balance: float, context: dict, dry_run: bool = False) -> tuple[bool, dict[str, Any]]:
+    execution_meta: dict[str, Any] = {"trade_id": None, "execution_ref": None, "pending_id": None}
     signal = decision.get("signal")
     if signal not in ("BUY", "SELL"):
-        return False
+        return False, execution_meta
 
     try:
         ai_sl  = float(decision.get("stop_loss", 0))
@@ -1446,8 +1697,8 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
         reason = decision.get("reason", "")
         setup  = decision.get("analysis", {}).get("setup_identified", "?")
     except (TypeError, ValueError) as e:
-        log_error(f"[{symbol}] Invalid SL/TP from AI", e)
-        return False
+        log_error(f"[{symbol}] Invalid SL/TP from selector", e)
+        return False, execution_meta
 
     entry = float(decision.get("entry_price") or context.get("current_price", 0))
     if entry == 0:
@@ -1456,23 +1707,23 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
             entry  = float(ticker["price"])
         except Exception as e:
             log_error(f"[{symbol}] Ticker fetch failed", e)
-            return False
+            return False, execution_meta
 
     if signal == "BUY" and not (ai_tp > entry > ai_sl):
         log_gate_fail("DIRECTION", f"BUY needs TP({ai_tp}) > entry({entry}) > SL({ai_sl})", symbol)
-        return False
+        return False, execution_meta
     if signal == "SELL" and not (ai_sl > entry > ai_tp):
         log_gate_fail("DIRECTION", f"SELL needs SL({ai_sl}) > entry({entry}) > TP({ai_tp})", symbol)
-        return False
+        return False, execution_meta
 
     risk_pct = abs(entry - ai_sl) / entry * 100
     if risk_pct < SL_MIN_PCT * 100:
         log_gate_fail("SL_MIN", f"SL {risk_pct:.3f}% < min {SL_MIN_PCT*100:.2f}%", symbol)
-        return False
+        return False, execution_meta
     max_stop_pct = compute_max_stop_pct(setup, context, entry=entry)
     if risk_pct > max_stop_pct * 100:
         log_gate_fail("SL_MAX", f"SL {risk_pct:.3f}% > max {max_stop_pct*100:.2f}%", symbol)
-        return False
+        return False, execution_meta
 
     risk      = abs(entry - ai_sl)
     reward    = abs(ai_tp - entry)
@@ -1487,7 +1738,7 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
         min_rr = TAKE_PROFIT_MIN_RR
     if rr < min_rr:
         log_gate_fail("RR", f"R:R={rr:.2f} < {min_rr}", symbol)
-        return False
+        return False, execution_meta
 
     min_notional = get_symbol_min_notional(client, symbol)
     qty = calc_quantity(balance, entry, ai_sl, symbol, min_notional)
@@ -1502,7 +1753,7 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
             ),
             symbol,
         )
-        return False
+        return False, execution_meta
 
     # --- Staged exit: partial TP1 + TP2 closePosition to avoid residual dust ---
     tp1_price = float(decision.get("take_profit_1") or ai_tp)
@@ -1526,7 +1777,8 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
     if dry_run:
         log_trade_open(symbol, signal, entry, ai_sl, tp1_price if staged else ai_tp,
                        rr, setup, reason, trade_id="DRY_RUN", context=context)
-        return True
+        execution_meta["execution_ref"] = "DRY_RUN"
+        return True, execution_meta
 
     side       = "BUY" if signal == "BUY" else "SELL"
     close_side = "SELL" if signal == "BUY" else "BUY"
@@ -1546,10 +1798,11 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
             strategy_policy_id=policy_id,
             strategy_policy_version=policy_version,
         )
+        execution_meta["pending_id"] = pending_id
         log.info(f"  [EXEC] PENDING record created id={pending_id}")
     except Exception as e:
         log_error(f"[{symbol}] Could not create PENDING record — aborting", e)
-        return False
+        return False, execution_meta
 
     try:
         client.change_leverage(symbol=sym_pair, leverage=LEVERAGE)
@@ -1609,12 +1862,14 @@ def execute_trade(client: UMFutures, symbol: str, decision: dict,
                         opened_at_ms=fill_time_ms or None)
         log_trade_open(symbol, signal, actual_price, ai_sl, db_tp1, rr,
                        setup, reason, trade_id=order_id, context=context)
-        return True
+        execution_meta["trade_id"] = pending_id
+        execution_meta["execution_ref"] = order_id
+        return True, execution_meta
 
     except Exception as e:
         log_error(f"[{symbol}] Order execution failed", e)
         db_cancel_pending(pending_id)
-        return False
+        return False, execution_meta
 
 
 def run_symbol_cycle(client: UMFutures, symbol: str,
@@ -1768,45 +2023,112 @@ def run_symbol_cycle(client: UMFutures, symbol: str,
             log_gate_fail("RANGE_POSITION", f"near resistance but RSI={rsi:.1f} — buyers not exhausted", symbol, ctx)
             return
 
-    log.info("  All gates passed → generating chart...")
-    chart_b64 = generate_chart(df_m15, ctx, df_h1=df_h1)
-    if not chart_b64:
-        log_error(f"[{symbol}] Chart generation failed")
-        return
-
-    log_ai_request(symbol, ctx.get("market_mode", "?"))
-    decision = ask_gemini(chart_b64, ctx, df_m15)
-    if decision is None:
-        log_error(f"[{symbol}] Gemini returned no response")
-        return
-
-    log_ai_response(decision)
+    log.info("  All gates passed → evaluating deterministic setup selector...")
+    decision = build_rule_based_signal_decision(ctx, df_m15)
     signal = decision.get("signal", "WAIT")
+    analysis = decision.get("analysis", {}) if isinstance(decision, dict) else {}
+    setup_name = analysis.get("setup_identified", "?")
+    log.info(f"  [RULE] setup={setup_name} signal={signal}")
+    log.info(f"  [RULE] EMA  : {analysis.get('ema_check', '')}")
+    log.info(f"  [RULE] PA   : {analysis.get('price_action', '')}")
+    log.info(f"  [RULE] VOL  : {analysis.get('volume_check', '')}")
+    log.info(f"  [RULE] R:R  : {analysis.get('rr_check', '')}")
+    log.info(f"  [RULE] Match: {analysis.get('pattern_match', '')}")
+    log.info(f"  [RULE] Reason: {decision.get('reason', '')}")
 
     if signal == "WAIT":
-        log.info(f"  [AI] WAIT — {decision.get('reason','')}")
-        log_skip("AI_WAIT", decision.get("reason", ""), ctx, decision)
+        db_record_opportunity(
+            symbol=symbol,
+            signal="WAIT",
+            setup=setup_name,
+            status="RULE_WAIT",
+            status_reason=decision.get("reason", ""),
+            context=ctx,
+            decision=_decision_for_snapshot(decision),
+            preview_plan_payload={"status": "NO_SIGNAL", "reason": decision.get("reason", "")},
+        )
+        log.info(f"  [RULE] WAIT — {decision.get('reason','')}")
+        log_skip("RULE_WAIT", decision.get("reason", ""), ctx, decision)
         log_cycle_summary(symbol, "WAIT", False, balance, ctx, decision)
         return
 
     ai_ok, ai_reason = validate_ai_trade_decision(decision, ctx, df_m15)
     if not ai_ok:
-        log_gate_fail("AI_VALIDATION", ai_reason, symbol, ctx)
-        log_skip("AI_INVALID", ai_reason, ctx, decision)
+        db_record_opportunity(
+            symbol=symbol,
+            signal=signal,
+            setup=setup_name,
+            status="RULE_INVALID",
+            status_reason=ai_reason,
+            context=ctx,
+            decision=_decision_for_snapshot(decision),
+            preview_plan_payload={"status": "RULE_INVALID", "reason": ai_reason},
+        )
+        log_gate_fail("RULE_VALIDATION", ai_reason, symbol, ctx)
+        log_skip("RULE_INVALID", ai_reason, ctx, decision)
         log_cycle_summary(symbol, "WAIT", False, balance, ctx, decision)
         return
 
     setup_name = decision.get("analysis", {}).get("setup_identified", "")
-    if not setup_enabled_in_policy(
+    preview_plan, preview_plan_reason = build_trade_plan(signal, setup_name, ctx, df_m15)
+    preview_plan_payload = _build_preview_plan_payload(preview_plan, preview_plan_reason)
+    symbol_policy_enabled = symbol_enabled_in_policy(
+        _ACTIVE_STRATEGY_POLICY.policy_json if _ACTIVE_STRATEGY_POLICY else {},
+        symbol,
+    )
+    setup_policy_enabled = setup_enabled_in_policy(
         _ACTIVE_STRATEGY_POLICY.policy_json if _ACTIVE_STRATEGY_POLICY else {},
         setup_name,
-    ):
+    )
+    if not symbol_policy_enabled:
+        policy_reason = f"{symbol} disabled by active strategy policy"
+        db_record_opportunity(
+            symbol=symbol,
+            signal=signal,
+            setup=setup_name,
+            status="POLICY_BLOCKED",
+            status_reason=policy_reason,
+            context=ctx,
+            decision=_decision_for_snapshot(decision, preview_plan),
+            preview_plan_payload=preview_plan_payload,
+        )
+        log_gate_fail("POLICY_SYMBOL", policy_reason, symbol, ctx)
+        log_skip("POLICY_SYMBOL", policy_reason, ctx, decision)
+        log_cycle_summary(symbol, "WAIT", False, balance, ctx, decision)
+        return
+    if not setup_policy_enabled:
         policy_reason = f"{setup_name or 'unknown setup'} disabled by active strategy policy"
+        db_record_opportunity(
+            symbol=symbol,
+            signal=signal,
+            setup=setup_name,
+            status="POLICY_BLOCKED",
+            status_reason=policy_reason,
+            context=ctx,
+            decision=_decision_for_snapshot(decision, preview_plan),
+            preview_plan_payload=preview_plan_payload,
+        )
         log_gate_fail("POLICY_SETUP", policy_reason, symbol, ctx)
         log_skip("POLICY_SETUP", policy_reason, ctx, decision)
         log_cycle_summary(symbol, "WAIT", False, balance, ctx, decision)
         return
-    # Refresh price after Gemini delay so SL/TP/RR are calculated from actual entry price.
+    if not preview_plan:
+        db_record_opportunity(
+            symbol=symbol,
+            signal=signal,
+            setup=setup_name,
+            status="PLAN_REJECTED",
+            status_reason=preview_plan_reason,
+            context=ctx,
+            decision=_decision_for_snapshot(decision),
+            preview_plan_payload=preview_plan_payload,
+        )
+        log_gate_fail("TRADE_PLAN", preview_plan_reason, symbol, ctx)
+        log_skip("TRADE_PLAN", preview_plan_reason, ctx, decision)
+        log_cycle_summary(symbol, "WAIT", False, balance, ctx, decision)
+        return
+
+    # Refresh price before final plan so SL/TP/RR are calculated from actual entry price.
     try:
         ticker = client.ticker_price(symbol=f"{symbol}USDT")
         fresh_price = float(ticker["price"])
@@ -1815,9 +2137,19 @@ def run_symbol_cycle(client: UMFutures, symbol: str,
             ctx["current_price"] = fresh_price
     except Exception as e:
         log.warning(f"  [PLAN] Price refresh failed ({e}) — using original price")
-    # Keep planning on the same 15m execution frame the LLM used for setup detection.
+    # Keep planning on the same 15m execution frame used for setup detection.
     plan, plan_reason = build_trade_plan(signal, setup_name, ctx, df_m15)
     if not plan:
+        db_record_opportunity(
+            symbol=symbol,
+            signal=signal,
+            setup=setup_name,
+            status="PLAN_REFRESH_REJECTED",
+            status_reason=plan_reason,
+            context=ctx,
+            decision=_decision_for_snapshot(decision),
+            preview_plan_payload=preview_plan_payload,
+        )
         log_gate_fail("TRADE_PLAN", plan_reason, symbol, ctx)
         log_skip("TRADE_PLAN", plan_reason, ctx, decision)
         log_cycle_summary(symbol, "WAIT", False, balance, ctx, decision)
@@ -1844,10 +2176,32 @@ def run_symbol_cycle(client: UMFutures, symbol: str,
 
     # Guard: skip if Binance already has an open position for this symbol
     if not dry_run and get_open_position(client, symbol) is not None:
+        db_record_opportunity(
+            symbol=symbol,
+            signal=signal,
+            setup=setup_name,
+            status="BINANCE_POSITION_EXISTS",
+            status_reason=f"{symbol} already has an open Binance position",
+            context=ctx,
+            decision=_decision_for_snapshot(decision, plan),
+            preview_plan_payload=_build_preview_plan_payload(plan, plan_reason),
+        )
         log.info(f"  [{symbol}] Binance position already open — skipping to avoid double entry")
         return
 
-    executed = execute_trade(client, symbol, decision, balance, ctx, dry_run=dry_run)
+    executed, execution_meta = execute_trade(client, symbol, decision, balance, ctx, dry_run=dry_run)
+    db_record_opportunity(
+        symbol=symbol,
+        signal=signal,
+        setup=setup_name,
+        status="DRY_RUN_EXECUTED" if dry_run and executed else "EXECUTED" if executed else "EXECUTION_FAILED",
+        status_reason="trade executed" if executed else "trade execution failed",
+        context=ctx,
+        decision=_decision_for_snapshot(decision, plan),
+        preview_plan_payload=_build_preview_plan_payload(plan, plan_reason),
+        linked_trade_id=execution_meta.get("trade_id"),
+        execution_ref=execution_meta.get("execution_ref"),
+    )
     log_cycle_summary(symbol, signal, executed, balance, ctx, decision)
 
 
@@ -1907,9 +2261,6 @@ def run_once(dry_run: bool = False):
 
     latest_balance = balance
     for symbol in SYMBOLS:
-        if not symbol_enabled_in_policy(policy.policy_json if policy else {}, symbol):
-            log.info(f"[{symbol}] Disabled by active strategy policy — skipping symbol")
-            continue
         try:
             latest_balance = get_account_balance(client)
             run_symbol_cycle(client, symbol, market_signals, latest_balance, dry_run)
