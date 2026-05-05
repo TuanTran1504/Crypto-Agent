@@ -7,10 +7,14 @@ Commands:
   /live    - live open positions with unrealized P&L
   /trades  - last 10 closed live trades
   /pnl     - live P&L summary
+  /review  - manually trigger a forced policy review
 """
 
+import asyncio
+import importlib
 import logging
 import os
+import sys
 from datetime import timezone
 from pathlib import Path
 
@@ -21,6 +25,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 ROOT = Path(__file__).resolve().parent.parent.parent
+SCHEDULE_DIR = ROOT / "backend" / "schedule"
 load_dotenv(ROOT / ".env")
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -33,6 +38,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 UTC = timezone.utc
+REVIEW_LOCK = asyncio.Lock()
 
 
 def get_db():
@@ -67,6 +73,61 @@ def fmt_price(val):
     if val is None:
         return "-"
     return f"{val:.2f}"
+
+
+def review_chat_is_authorized(update: Update) -> bool:
+    if CHAT_ID <= 0:
+        return False
+    chat = update.effective_chat
+    return bool(chat and chat.id == CHAT_ID)
+
+
+def build_review_override_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    chat = update.effective_chat
+    user = update.effective_user
+    note = " ".join(getattr(context, "args", []) or []).strip()
+    user_text = "unknown"
+    if user:
+        username = f":{user.username}" if user.username else ""
+        user_text = f"{user.id}{username}"
+    chat_id = chat.id if chat else 0
+    reason = f"telegram:/review chat={chat_id} user={user_text}"
+    if note:
+        reason = f"{reason} note={note}"
+    return reason
+
+
+def format_review_result(result: dict) -> str:
+    lines = [f"Policy review status: {result.get('status', 'unknown')}"]
+    if result.get("run_id") is not None:
+        lines.append(f"run_id: {result['run_id']}")
+    if result.get("policy_id") is not None:
+        lines.append(
+            "policy: "
+            f"id={result['policy_id']} "
+            f"version={result.get('policy_version', '-')} "
+            f"status={result.get('policy_status', '-')}"
+        )
+    reason = str(result.get("reason") or "").strip()
+    if reason:
+        lines.append(f"reason: {reason}")
+    manual_override = dict(result.get("manual_override") or {})
+    if manual_override.get("force_review"):
+        lines.append("manual_override: force_review=true")
+    validation = dict(result.get("validation") or {})
+    proposal_score = dict(validation.get("proposal_score") or {})
+    if proposal_score:
+        lines.append(
+            f"proposal_score: {proposal_score.get('score', '-')} "
+            f"({proposal_score.get('verdict', '-')})"
+        )
+    return "\n".join(lines)
+
+
+def get_policy_review_runner():
+    if str(SCHEDULE_DIR) not in sys.path:
+        sys.path.insert(0, str(SCHEDULE_DIR))
+    return importlib.import_module("run_policy_review")
 
 
 def fetch_open_trades(account_type=None):
@@ -228,7 +289,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/live - live open trades with unrealized P&L\n"
         "/trades - last 10 live closed trades\n"
         "/pnl - live account P&L summary\n"
-        "/livepnl - same as /pnl"
+        "/livepnl - same as /pnl\n"
+        "/review [optional note] - force a manual policy review"
     )
 
 
@@ -322,6 +384,45 @@ async def cmd_livepnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_pnl(update, context)
 
 
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if CHAT_ID <= 0:
+        await update.message.reply_text(
+            "Manual review is disabled because TELEGRAM_CHAT_ID is not configured."
+        )
+        return
+
+    if not review_chat_is_authorized(update):
+        chat = update.effective_chat
+        log.warning("Rejected /review from unauthorized chat_id=%s", getattr(chat, "id", None))
+        await update.message.reply_text("Unauthorized chat for manual policy review.")
+        return
+
+    if REVIEW_LOCK.locked():
+        await update.message.reply_text("A manual policy review is already running. Please wait.")
+        return
+
+    review_reason = build_review_override_reason(update, context)
+    await update.message.reply_text(
+        "Starting manual policy review with gate bypass.\n"
+        f"reason: {review_reason}"
+    )
+
+    try:
+        async with REVIEW_LOCK:
+            runner = get_policy_review_runner()
+            result = await asyncio.to_thread(
+                runner.run_policy_review_once,
+                force_review=True,
+                force_review_reason=review_reason,
+            )
+    except Exception as exc:
+        log.exception("Manual /review failed")
+        await update.message.reply_text(f"Manual policy review failed: {exc}")
+        return
+
+    await update.message.reply_text(format_review_result(result))
+
+
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -330,6 +431,7 @@ def main():
     app.add_handler(CommandHandler("trades", cmd_trades))
     app.add_handler(CommandHandler("pnl", cmd_pnl))
     app.add_handler(CommandHandler("livepnl", cmd_livepnl))
+    app.add_handler(CommandHandler("review", cmd_review))
 
     log.info("Telegram bot started - polling...")
     app.run_polling(allowed_updates=["message"])
