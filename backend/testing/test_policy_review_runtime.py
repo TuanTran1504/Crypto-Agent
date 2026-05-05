@@ -356,6 +356,102 @@ class PolicyReviewRuntimeTests(unittest.TestCase):
         self.assertTrue(payload["llm_payload"]["manual_override"]["bypassed_guard_gate"])
         self.assertEqual(payload["llm_payload"]["manual_override"]["reason"], "telegram:/review")
 
+    def test_run_policy_review_once_force_review_can_auto_apply_override(self):
+        cfg = ReviewGuardConfig(trades_table="trades_live")
+        guard = ReviewGuardResult(
+            decision="HOLD",
+            reason="closed_trades_since_update=1 < 20",
+            guard_config=asdict(cfg),
+            context={
+                "active_policy": {"id": 12, "version": 5},
+                "policy_timing": {"hours_since_update": 3.0},
+                "post_update_sample": {"closed_trades_since_update": 1},
+            },
+        )
+        active_row = {
+            "id": 12,
+            "version": 5,
+            "policy_json": {"global": {"trade_min_rr": 1.5, "trade_min_rr_range": 1.4}},
+            "engine_name": "llm_live",
+            "account_type": "live",
+            "policy_name": "default",
+        }
+        review_input = {
+            "active_policy": {"id": 12, "version": 5},
+            "guard": asdict(guard),
+            "deterministic_checks": {
+                "allow_llm_proposal": True,
+                "clear_signal_for_risk_increase": False,
+                "risk_constraints": {"max_changed_keys": 2},
+                "clear_signal_evidence": {"closed_trades_since_update": 1},
+            },
+        }
+        captured_payload: dict[str, object] = {}
+
+        class FakeConn:
+            def commit(self):
+                return None
+
+            def close(self):
+                return None
+
+        def fake_insert(_conn, payload):
+            captured_payload["payload"] = payload
+            return 777
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "postgresql://example.local/test",
+                "POLICY_REVIEW_ENABLED": "1",
+                "POLICY_REVIEW_AUTO_APPLY": "0",
+            },
+            clear=False,
+        ):
+            with mock.patch.object(
+                prod,
+                "build_policy_review_context",
+                return_value=(review_input, active_row, guard, cfg),
+            ):
+                with mock.patch.object(prod.psycopg2, "connect", return_value=FakeConn()):
+                    with mock.patch.object(prod, "_insert_policy_review_run", side_effect=fake_insert):
+                        with mock.patch.object(
+                            prod,
+                            "_call_llm_reviewer",
+                            return_value={
+                                "decision": "PROPOSE_CHANGE",
+                                "reason": "Tighten one threshold",
+                                "_meta": {"model": "gpt-5-mini"},
+                                "changes": [
+                                    {"path": "global.trade_min_rr_range", "value": 1.6},
+                                ],
+                            },
+                        ):
+                            with mock.patch.object(
+                                prod,
+                                "_create_policy_version",
+                                return_value=(88, 6, "active"),
+                            ) as create_version:
+                                result = prod.run_policy_review_once(
+                                    force_review=True,
+                                    force_review_reason="telegram:/review apply",
+                                    auto_apply_override=True,
+                                )
+
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["run_id"], 777)
+        self.assertEqual(result["policy_id"], 88)
+        self.assertEqual(result["policy_version"], 6)
+        self.assertEqual(result["policy_status"], "active")
+        manual_override = result["manual_override"]
+        self.assertTrue(manual_override["force_review"])
+        self.assertTrue(manual_override["auto_apply_override"])
+        payload = captured_payload["payload"]
+        self.assertEqual(payload["llm_decision"], "APPLIED")
+        self.assertTrue(payload["guard_payload"]["manual_override"]["auto_apply_override"])
+        self.assertTrue(payload["llm_payload"]["manual_override"]["auto_apply_override"])
+        self.assertTrue(create_version.call_args.kwargs["auto_activate"])
+
 
 if __name__ == "__main__":
     unittest.main()

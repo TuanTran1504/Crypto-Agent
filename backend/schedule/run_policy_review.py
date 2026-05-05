@@ -66,10 +66,20 @@ def _resolve_force_review_reason(force_review_reason: str | None = None) -> str 
     return _clean_optional_text(os.getenv("POLICY_REVIEW_FORCE_REVIEW_REASON", ""))
 
 
+def _resolve_auto_apply_override(auto_apply_override: bool | None = None) -> bool | None:
+    if auto_apply_override is not None:
+        return bool(auto_apply_override)
+    raw = os.getenv("POLICY_REVIEW_AUTO_APPLY_OVERRIDE")
+    if raw is None:
+        return None
+    return _env_bool(raw, default=False)
+
+
 def _build_manual_override_payload(
     *,
     force_review: bool,
     force_review_reason: str | None,
+    auto_apply_override: bool | None,
     policy_review_enabled: bool,
     guard_decision: str,
 ) -> dict[str, Any]:
@@ -77,6 +87,7 @@ def _build_manual_override_payload(
     return {
         "force_review": bool(force_review),
         "reason": force_review_reason if force_review else None,
+        "auto_apply_override": bool(auto_apply_override) if auto_apply_override is not None else None,
         "bypassed_policy_review_enabled": bool(force_review and not policy_review_enabled),
         "bypassed_guard_gate": bool(force_review and guard_decision_text != "ALLOW_REVIEW"),
     }
@@ -2103,9 +2114,11 @@ def run_policy_review_once(
     *,
     force_review: bool | None = None,
     force_review_reason: str | None = None,
+    auto_apply_override: bool | None = None,
 ) -> dict[str, Any]:
     force_review = _resolve_force_review(force_review)
     force_review_reason = _resolve_force_review_reason(force_review_reason)
+    auto_apply_override = _resolve_auto_apply_override(auto_apply_override)
     policy_review_enabled = _env_bool(os.getenv("POLICY_REVIEW_ENABLED", "1"), default=True)
     if not policy_review_enabled and not force_review:
         return {
@@ -2150,6 +2163,7 @@ def run_policy_review_once(
     manual_override = _build_manual_override_payload(
         force_review=force_review,
         force_review_reason=force_review_reason,
+        auto_apply_override=auto_apply_override,
         policy_review_enabled=policy_review_enabled,
         guard_decision=guard.decision,
     )
@@ -2317,7 +2331,11 @@ def run_policy_review_once(
             )
 
         merged_policy = _deep_merge(active_policy_json, sanitized_patch)
-        auto_apply = _env_bool(os.getenv("POLICY_REVIEW_AUTO_APPLY", "0"), default=False)
+        auto_apply = (
+            bool(auto_apply_override)
+            if auto_apply_override is not None
+            else _env_bool(os.getenv("POLICY_REVIEW_AUTO_APPLY", "0"), default=False)
+        )
         allow_risk_increase = bool(risk_increase_changes) and clear_signal
         validation_report = {
             "review_type": "llm_policy_review",
@@ -2407,11 +2425,17 @@ def main():
         default="",
         help="Optional audit note for a manual override, e.g. telegram:/review",
     )
+    parser.add_argument(
+        "--force-apply",
+        action="store_true",
+        help="Auto-activate a validated policy for this run, regardless of POLICY_REVIEW_AUTO_APPLY.",
+    )
     args = parser.parse_args()
 
     result = run_policy_review_once(
         force_review=True if args.force_review else None,
         force_review_reason=args.force_review_reason or None,
+        auto_apply_override=True if args.force_apply else None,
     )
     output = _json_dumps(result)
     if not args.json_only:

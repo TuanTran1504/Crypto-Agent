@@ -114,6 +114,8 @@ def format_review_result(result: dict) -> str:
     manual_override = dict(result.get("manual_override") or {})
     if manual_override.get("force_review"):
         lines.append("manual_override: force_review=true")
+    if manual_override.get("auto_apply_override"):
+        lines.append("manual_override: auto_apply=true")
     validation = dict(result.get("validation") or {})
     proposal_score = dict(validation.get("proposal_score") or {})
     if proposal_score:
@@ -403,7 +405,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     review_reason = build_review_override_reason(update, context)
     await update.message.reply_text(
-        "Starting manual policy review with gate bypass.\n"
+        "Starting manual policy review with gate bypass and auto-apply on success.\n"
         f"reason: {review_reason}"
     )
 
@@ -414,6 +416,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 runner.run_policy_review_once,
                 force_review=True,
                 force_review_reason=review_reason,
+                auto_apply_override=True,
             )
     except Exception as exc:
         log.exception("Manual /review failed")
